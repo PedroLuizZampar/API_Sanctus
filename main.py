@@ -1,4 +1,5 @@
 import os
+import random
 import asyncio
 import time
 import logging
@@ -8,7 +9,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import psycopg2
 from psycopg2 import sql
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 
@@ -23,6 +24,8 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 NEON_DATABASE_URL = os.environ.get("NEON_DATABASE_URL", "")
+MAGISTERIUM_API_KEY = os.environ.get("MAGISTERIUM_API_KEY", "")
+SANCTUS_APP_TOKEN = os.environ.get("SANCTUS_APP_TOKEN", "")
 
 # =============================================================================
 # Cliente do Gemini (biblioteca oficial google-genai)
@@ -65,7 +68,7 @@ Escreva uma oração íntima, sincera e profunda em primeira pessoa do singular 
 """
 
 PROMPT_CURIOSIDADES = """
-  Atue como um Professor de História da Igreja e Catequista dinâmico. Quero que você crie um texto fascinante, rico em conteúdo e altamente visual sobre um assunto curioso, artístico, histórico ou teológico da fé católica (Ex: arquitetura, relíquias, catacumbas, sacramentais, vestes litúrgicas, tradições esquecidas).
+  Atue como um Professor de História da Igreja e Catequista dinâmico. Quero que você crie um texto fascinante, rico em conteúdo e altamente visual sobre o seguinte assunto da fé católica: **{tema}**.
 
 O tom deve ser natural, instigante, que desperte curiosidade no leitor, mantendo a profundidade e a reverência teológica. Não responda como um modelo de IA; comece diretamente no texto.
 
@@ -95,7 +98,7 @@ Escreva uma conclusão profunda e de fácil compreensão, consolidando o aprendi
 
 ---
 
-## Escolha um assunto católico aleatório e fascinante e gere o texto seguindo o modelo acima.
+Gere o texto seguindo rigorosamente o tema fornecido (**{tema}**) e o modelo de estrutura acima.
 """
 
 
@@ -329,7 +332,26 @@ async def gerar_conteudo():
 
             async def gerar_curiosidade():
                 nonlocal texto_curiosidade
-                texto_curiosidade = await chamar_gemini(PROMPT_CURIOSIDADES)
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                temas_file = os.path.join(base_dir, "Temas_Curiosidades.txt")
+                tema_escolhido = "um assunto católico aleatório e fascinante"
+
+                try:
+                    if os.path.exists(temas_file):
+                        with open(temas_file, "r", encoding="utf-8") as f:
+                            temas = [linha.strip() for linha in f if linha.strip()]
+                        if temas:
+                            tema_escolhido = random.choice(temas)
+                            logger.info(f"[Gerar Conteúdo] Tema de curiosidade escolhido do arquivo: '{tema_escolhido}'")
+                        else:
+                            logger.warning("[Gerar Conteúdo] Arquivo de temas de curiosidades está vazio. Usando fallback.")
+                    else:
+                        logger.warning(f"[Gerar Conteúdo] Arquivo {temas_file} não encontrado. Usando fallback.")
+                except Exception as e:
+                    logger.error(f"[Gerar Conteúdo] Erro ao ler arquivo de temas de curiosidades: {e}. Usando fallback.")
+
+                prompt_formatado = PROMPT_CURIOSIDADES.format(tema=tema_escolhido)
+                texto_curiosidade = await chamar_gemini(prompt_formatado)
 
             tarefas.append(gerar_curiosidade())
 
@@ -465,3 +487,69 @@ async def obter_curiosidades(date: str = Query(default=None, description="Data n
     finally:
         if conn:
             conn.close()
+
+
+# -------------------------------------------------------------------------
+# POST /api/v1/chat
+# -------------------------------------------------------------------------
+@app.post("/api/v1/chat")
+async def proxy_chat(
+    payload: dict,
+    x_sanctus_token: str = Header(default=None, alias="x-sanctus-token")
+):
+    """
+    Proxy seguro para a API do Magisterium AI.
+    Valida o token compartilhado 'x-sanctus-token' antes de fazer o redirecionamento.
+    """
+    # 1. Validar se o token do App foi configurado no servidor
+    # Se estiver configurado, validar se o cabeçalho bate
+    if SANCTUS_APP_TOKEN and x_sanctus_token != SANCTUS_APP_TOKEN:
+        logger.warning(f"[Proxy Chat] Acesso não autorizado. Header: {x_sanctus_token}")
+        raise HTTPException(
+            status_code=401,
+            detail="Acesso não autorizado: Token inválido ou ausente."
+        )
+
+    # 2. Validar se a chave do Magisterium AI está configurada no servidor
+    if not MAGISTERIUM_API_KEY:
+        logger.error("[Proxy Chat] Chave MAGISTERIUM_API_KEY não configurada no servidor.")
+        raise HTTPException(
+            status_code=500,
+            detail="Chave de API do Magisterium AI não configurada no servidor."
+        )
+
+    url = "https://www.magisterium.com/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {MAGISTERIUM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            
+            if not response.is_success:
+                logger.error(f"[Proxy Chat] Erro do Magisterium AI: {response.status_code} - {response.text}")
+                try:
+                    error_detail = response.json()
+                except Exception:
+                    error_detail = response.text
+                
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=error_detail
+                )
+            
+            return response.json()
+    except httpx.RequestError as e:
+        logger.error(f"[Proxy Chat] Erro de rede: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Erro de conexão com o Magisterium AI: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"[Proxy Chat] Erro inesperado: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro interno no proxy: {str(e)}"
+        )
