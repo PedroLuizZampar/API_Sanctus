@@ -13,8 +13,9 @@ import psycopg2
 from psycopg2 import sql
 import bcrypt
 import jwt
-from fastapi import FastAPI, HTTPException, Query, Header, Depends
+from fastapi import FastAPI, HTTPException, Query, Header, Depends, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from google import genai
 from dotenv import load_dotenv
 
@@ -140,6 +141,48 @@ class SyncRequest(BaseModel):
     favorites: List[FavoriteChangeItem]
     highlights: List[HighlightChangeItem]
     chats: Optional[List[ChatChangeItem]] = []
+
+class ActivityChangeItem(BaseModel):
+    id: str
+    titulo: str
+    dia: Optional[str] = None
+    horario: str
+    lembrete_ativo: bool
+    lembrete_minutos_antes: int
+    repetir: bool
+    frequencia: Optional[str] = None
+    dias_semana: Optional[str] = None
+    cor: str
+    mensagem_lembrete: Optional[str] = None
+    terminar_tipo: Optional[str] = 'nunca'
+    terminar_vezes: Optional[int] = 0
+    terminar_data: Optional[str] = None
+    icone: Optional[str] = None
+    updated_at: int
+    is_deleted: bool
+
+class ActivityCompletionChangeItem(BaseModel):
+    id: str
+    activity_id: str
+    data: str
+    updated_at: int
+    is_deleted: bool
+
+class ActivityExclusionChangeItem(BaseModel):
+    id: str
+    activity_id: str
+    data: str
+    updated_at: int
+    is_deleted: bool
+
+class SyncRequest(BaseModel):
+    last_sync_timestamp: int
+    favorites: List[FavoriteChangeItem]
+    highlights: List[HighlightChangeItem]
+    chats: Optional[List[ChatChangeItem]] = []
+    activities: Optional[List[ActivityChangeItem]] = []
+    completions: Optional[List[ActivityCompletionChangeItem]] = []
+    exclusions: Optional[List[ActivityExclusionChangeItem]] = []
 
 class UpdateEmailRequest(BaseModel):
     new_email: str
@@ -383,17 +426,74 @@ def garantir_tabelas(conn):
                 created_at_db TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS activities (
+                id TEXT PRIMARY KEY,
+                user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                titulo TEXT NOT NULL,
+                dia TEXT,
+                horario TEXT NOT NULL,
+                lembrete_ativo BOOLEAN DEFAULT FALSE,
+                lembrete_minutos_antes INTEGER DEFAULT 0,
+                repetir BOOLEAN DEFAULT FALSE,
+                frequencia TEXT,
+                dias_semana TEXT,
+                cor TEXT NOT NULL,
+                mensagem_lembrete TEXT DEFAULT NULL,
+                terminar_tipo TEXT DEFAULT 'nunca',
+                terminar_vezes INTEGER DEFAULT 0,
+                terminar_data TEXT DEFAULT NULL,
+                updated_at BIGINT NOT NULL,
+                is_deleted BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS activity_completions (
+                id TEXT PRIMARY KEY,
+                user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                activity_id TEXT REFERENCES activities(id) ON DELETE CASCADE,
+                data TEXT NOT NULL,
+                updated_at BIGINT NOT NULL,
+                is_deleted BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
         # Índices para otimizar a sincronização
         cur.execute("CREATE INDEX IF NOT EXISTS idx_favorites_user_sync ON favorites(user_id, updated_at);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_highlights_user_sync ON highlights(user_id, updated_at);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chats_user_sync ON chats(user_id, updated_at);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_activities_user_sync ON activities(user_id, updated_at);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_activity_completions_user_sync ON activity_completions(user_id, updated_at);")
+        
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS activity_exclusions (
+                id TEXT PRIMARY KEY,
+                user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                activity_id TEXT REFERENCES activities(id) ON DELETE CASCADE,
+                data TEXT NOT NULL,
+                updated_at BIGINT NOT NULL,
+                is_deleted BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_activity_exclusions_user_sync ON activity_exclusions(user_id, updated_at);")
 
-        # Migração segura para colunas de reset de senha
+        # Migração segura para colunas de reset de senha, avatar e remoção de categoria
         try:
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT DEFAULT NULL;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires BIGINT DEFAULT NULL;")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT NULL;")
+            cur.execute("ALTER TABLE activities DROP COLUMN IF EXISTS categoria;")
+            cur.execute("ALTER TABLE activities ADD COLUMN IF NOT EXISTS terminar_tipo TEXT DEFAULT 'nunca';")
+            cur.execute("ALTER TABLE activities ADD COLUMN IF NOT EXISTS terminar_vezes INTEGER DEFAULT 0;")
+            cur.execute("ALTER TABLE activities ADD COLUMN IF NOT EXISTS terminar_data TEXT DEFAULT NULL;")
+            cur.execute("ALTER TABLE activities ADD COLUMN IF NOT EXISTS icone TEXT DEFAULT NULL;")
         except Exception as me:
-            logger.warning(f"Erro ao adicionar colunas de reset em users: {me}")
+            logger.warning(f"Erro ao adicionar/remover colunas: {me}")
     conn.commit()
     logger.info("Tabelas verificadas/criadas com sucesso.")
 
@@ -481,6 +581,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+os.makedirs("static/avatars", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 # =============================================================================
 # ENDPOINTS DE AUTENTICAÇÃO
@@ -522,7 +625,8 @@ async def register(req: RegisterRequest):
                 "user": {
                     "id": str(user_id),
                     "nome": u_nome,
-                    "email": u_email
+                    "email": u_email,
+                    "avatar_url": None
                 },
                 "token": token
             }
@@ -550,20 +654,21 @@ async def login(req: LoginRequest):
     try:
         conn = conectar_banco()
         with conn.cursor() as cur:
-            cur.execute("SELECT id, nome, email, password_hash FROM users WHERE email = %s", (email,))
+            cur.execute("SELECT id, nome, email, password_hash, avatar_url FROM users WHERE email = %s", (email,))
             user = cur.fetchone()
 
             if not user or not verify_password(password, user[3]):
                 raise HTTPException(status_code=400, detail="Credenciais inválidas.")
 
-            user_id, u_nome, u_email = user[0], user[1], user[2]
+            user_id, u_nome, u_email, _, u_avatar = user[0], user[1], user[2], user[3], user[4]
             token = create_access_token(user_id, u_email)
 
             return {
                 "user": {
                     "id": str(user_id),
                     "nome": u_nome,
-                    "email": u_email
+                    "email": u_email,
+                    "avatar_url": u_avatar
                 },
                 "token": token
             }
@@ -572,6 +677,39 @@ async def login(req: LoginRequest):
     except Exception as e:
         logger.error(f"[Auth Login] Erro no login: {e}")
         raise HTTPException(status_code=500, detail="Erro interno ao realizar login.")
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.post("/api/v1/user/upload-avatar")
+async def upload_avatar(file: UploadFile = File(...), user_id: str = Depends(get_current_user_id)):
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Formato de arquivo inválido. Apenas imagens são permitidas.")
+    
+    ext = "jpg"
+    filename = f"{user_id}.{ext}"
+    filepath = os.path.join("static", "avatars", filename)
+    
+    conn = None
+    try:
+        content = await file.read()
+        with open(filepath, "wb") as f:
+            f.write(content)
+            
+        avatar_url = f"/static/avatars/{filename}"
+        
+        conn = conectar_banco()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET avatar_url = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s", (avatar_url, user_id))
+            conn.commit()
+            
+        return {"avatar_url": avatar_url}
+    except Exception as e:
+        logger.error(f"[User Upload Avatar] Erro: {e}")
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Erro ao processar upload do avatar: {str(e)}")
     finally:
         if conn:
             conn.close()
@@ -852,6 +990,93 @@ async def sync(req: SyncRequest, user_id: str = Depends(get_current_user_id)):
                             (chat.title, chat.created_at, chat.updated_at, chat.messages_json, chat.is_deleted, chat.id, user_id)
                         )
 
+            # 3.5. Processar Atividades do Cliente
+            client_activity_ids = set()
+            activities_payload = req.activities or []
+            for act in activities_payload:
+                client_activity_ids.add(act.id)
+                cur.execute(
+                    "SELECT updated_at, is_deleted FROM activities WHERE id = %s AND user_id = %s",
+                    (act.id, user_id)
+                )
+                row = cur.fetchone()
+                if not row:
+                    cur.execute(
+                        """INSERT INTO activities (id, user_id, titulo, dia, horario, lembrete_ativo, 
+                                                   lembrete_minutos_antes, repetir, frequencia, dias_semana, cor, 
+                                                   mensagem_lembrete, terminar_tipo, terminar_vezes, terminar_data, 
+                                                   icone, updated_at, is_deleted)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (act.id, user_id, act.titulo, act.dia, act.horario, act.lembrete_ativo,
+                         act.lembrete_minutos_antes, act.repetir, act.frequencia, act.dias_semana, act.cor,
+                         act.mensagem_lembrete, act.terminar_tipo, act.terminar_vezes, act.terminar_data,
+                         act.icone, act.updated_at, act.is_deleted)
+                    )
+                else:
+                    db_updated_at, db_is_deleted = row[0], row[1]
+                    if act.updated_at > db_updated_at:
+                        cur.execute(
+                            """UPDATE activities SET titulo=%s, dia=%s, horario=%s, lembrete_ativo=%s, 
+                                                     lembrete_minutos_antes=%s, repetir=%s, frequencia=%s, dias_semana=%s, 
+                                                     cor=%s, mensagem_lembrete=%s, terminar_tipo=%s, terminar_vezes=%s, 
+                                                     terminar_data=%s, icone=%s, updated_at=%s, is_deleted=%s
+                               WHERE id=%s AND user_id=%s""",
+                            (act.titulo, act.dia, act.horario, act.lembrete_ativo,
+                             act.lembrete_minutos_antes, act.repetir, act.frequencia, act.dias_semana, act.cor,
+                             act.mensagem_lembrete, act.terminar_tipo, act.terminar_vezes, act.terminar_data,
+                             act.icone, act.updated_at, act.is_deleted, act.id, user_id)
+                        )
+
+            # 3.6. Processar Conclusões de Atividades do Cliente
+            client_completion_ids = set()
+            completions_payload = req.completions or []
+            for comp in completions_payload:
+                client_completion_ids.add(comp.id)
+                cur.execute(
+                    "SELECT updated_at, is_deleted FROM activity_completions WHERE id = %s AND user_id = %s",
+                    (comp.id, user_id)
+                )
+                row = cur.fetchone()
+                if not row:
+                    cur.execute(
+                        """INSERT INTO activity_completions (id, user_id, activity_id, data, updated_at, is_deleted)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (comp.id, user_id, comp.activity_id, comp.data, comp.updated_at, comp.is_deleted)
+                    )
+                else:
+                    db_updated_at, db_is_deleted = row[0], row[1]
+                    if comp.updated_at > db_updated_at:
+                        cur.execute(
+                            """UPDATE activity_completions SET activity_id=%s, data=%s, updated_at=%s, is_deleted=%s
+                               WHERE id=%s AND user_id=%s""",
+                            (comp.activity_id, comp.data, comp.updated_at, comp.is_deleted, comp.id, user_id)
+                        )
+
+            # 3.7. Processar Exclusões de Atividades do Cliente
+            client_exclusion_ids = set()
+            exclusions_payload = req.exclusions or []
+            for exc in exclusions_payload:
+                client_exclusion_ids.add(exc.id)
+                cur.execute(
+                    "SELECT updated_at, is_deleted FROM activity_exclusions WHERE id = %s AND user_id = %s",
+                    (exc.id, user_id)
+                )
+                row = cur.fetchone()
+                if not row:
+                    cur.execute(
+                        """INSERT INTO activity_exclusions (id, user_id, activity_id, data, updated_at, is_deleted)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (exc.id, user_id, exc.activity_id, exc.data, exc.updated_at, exc.is_deleted)
+                    )
+                else:
+                    db_updated_at, db_is_deleted = row[0], row[1]
+                    if exc.updated_at > db_updated_at:
+                        cur.execute(
+                            """UPDATE activity_exclusions SET activity_id=%s, data=%s, updated_at=%s, is_deleted=%s
+                               WHERE id=%s AND user_id=%s""",
+                            (exc.activity_id, exc.data, exc.updated_at, exc.is_deleted, exc.id, user_id)
+                        )
+
             # 4. Obter alterações do banco para o Cliente (novidades desde a última data de sync do cliente)
             # Apenas registros onde updated_at > last_sync_timestamp e que não foram enviados pelo cliente agora
             
@@ -914,7 +1139,7 @@ async def sync(req: SyncRequest, user_id: str = Depends(get_current_user_id)):
                         "updated_at": int(row[12]),
                         "is_deleted": bool(row[13])
                     })
-
+ 
             # Buscar chats atualizados
             query_chat = """
                 SELECT id, title, created_at, updated_at, messages_json, is_deleted
@@ -935,6 +1160,80 @@ async def sync(req: SyncRequest, user_id: str = Depends(get_current_user_id)):
                         "messages_json": row[4],
                         "is_deleted": bool(row[5])
                     })
+
+            # Buscar atividades atualizadas
+            query_act = """
+                SELECT id, titulo, dia, horario, lembrete_ativo, lembrete_minutos_antes, 
+                       repetir, frequencia, dias_semana, cor, mensagem_lembrete, terminar_tipo, 
+                       terminar_vezes, terminar_data, icone, updated_at, is_deleted
+                FROM activities 
+                WHERE user_id = %s AND updated_at > %s
+            """
+            cur.execute(query_act, (user_id, req.last_sync_timestamp))
+            db_activities = cur.fetchall()
+            
+            server_activities = []
+            for row in db_activities:
+                if row[0] not in client_activity_ids:
+                    server_activities.append({
+                        "id": row[0],
+                        "titulo": row[1],
+                        "dia": row[2],
+                        "horario": row[3],
+                        "lembrete_ativo": bool(row[4]),
+                        "lembrete_minutos_antes": int(row[5]),
+                        "repetir": bool(row[6]),
+                        "frequencia": row[7],
+                        "dias_semana": row[8],
+                        "cor": row[9],
+                        "mensagem_lembrete": row[10],
+                        "terminar_tipo": row[11],
+                        "terminar_vezes": int(row[12]),
+                        "terminar_data": row[13],
+                        "icone": row[14],
+                        "updated_at": int(row[15]),
+                        "is_deleted": bool(row[16])
+                    })
+
+            # Buscar conclusões atualizadas
+            query_comp = """
+                SELECT id, activity_id, data, updated_at, is_deleted
+                FROM activity_completions 
+                WHERE user_id = %s AND updated_at > %s
+            """
+            cur.execute(query_comp, (user_id, req.last_sync_timestamp))
+            db_completions = cur.fetchall()
+            
+            server_completions = []
+            for row in db_completions:
+                if row[0] not in client_completion_ids:
+                    server_completions.append({
+                        "id": row[0],
+                        "activity_id": row[1],
+                        "data": row[2],
+                        "updated_at": int(row[3]),
+                        "is_deleted": bool(row[4])
+                    })
+
+            # Buscar exclusões atualizadas
+            query_exc = """
+                SELECT id, activity_id, data, updated_at, is_deleted
+                FROM activity_exclusions 
+                WHERE user_id = %s AND updated_at > %s
+            """
+            cur.execute(query_exc, (user_id, req.last_sync_timestamp))
+            db_exclusions = cur.fetchall()
+            
+            server_exclusions = []
+            for row in db_exclusions:
+                if row[0] not in client_exclusion_ids:
+                    server_exclusions.append({
+                        "id": row[0],
+                        "activity_id": row[1],
+                        "data": row[2],
+                        "updated_at": int(row[3]),
+                        "is_deleted": bool(row[4])
+                    })
  
             # Efetivar transação
             conn.commit()
@@ -944,7 +1243,10 @@ async def sync(req: SyncRequest, user_id: str = Depends(get_current_user_id)):
                 "changes": {
                     "favorites": server_favorites,
                     "highlights": server_highlights,
-                    "chats": server_chats
+                    "chats": server_chats,
+                    "activities": server_activities,
+                    "completions": server_completions,
+                    "exclusions": server_exclusions
                 }
             }
     except Exception as e:
